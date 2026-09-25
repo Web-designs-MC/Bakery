@@ -164,8 +164,10 @@ dl .total{border-top:1px solid var(--line);padding-top:6px}
     <div class="sync">
       <span class="status" id="status" role="status">Starting…</span>
       <button id="saveBtn" class="primary" type="button">Save to Drive</button>
-      <button id="dlBtn" class="primary" type="button" hidden>Download backup</button>
-      <button id="ulBtn" type="button" hidden>Open backup</button>
+      <button id="gdBtn" class="primary" type="button" hidden>Connect Google Drive</button>
+      <span id="gdMenu" class="row" hidden><a id="gdFolder" target="_blank" rel="noopener" class="small" hidden>Open Drive folder</a><button id="gdSync" type="button">Save now</button><button id="gdSettings" type="button" class="ghost">Settings</button><button id="gdOut" type="button" class="ghost">Disconnect</button></span>
+      <button id="dlBtn" class="ghost" type="button" hidden>Download backup</button>
+      <button id="ulBtn" class="ghost" type="button" hidden>Open backup</button>
       <input type="file" id="ulInput" accept="application/json,.json" class="sr" aria-label="Open a backup file">
     </div>
   </header>
@@ -176,6 +178,19 @@ dl .total{border-top:1px solid var(--line);padding-top:6px}
     <button class="tab" role="tab" data-tab="equipment" id="tab-equipment">Equipment<span class="count" id="c-equipment"></span></button>
   </nav>
   <div id="banner" class="banner" hidden></div>
+  <section id="gdPanel" class="card" hidden style="margin-bottom:12px">
+    <h3>Connect Google Drive</h3>
+    <p class="small muted">One-time setup in Google Cloud Console. Paste the Client ID it gives you below.</p>
+    <ol class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">
+      <li>Go to console.cloud.google.com and create a project (e.g. “Bakery App”).</li>
+      <li>APIs &amp; Services → Library → enable <b>Google Drive API</b>.</li>
+      <li>OAuth consent screen → External → fill in the app name and your email, add the scope <b>.../auth/drive.file</b>, and add your Gmail under <b>Test users</b>.</li>
+      <li>Credentials → Create credentials → OAuth client ID → <b>Web application</b>. Under Authorised JavaScript origins add <b id="gdOrigin"></b></li>
+      <li>Copy the Client ID (ends in .apps.googleusercontent.com) and paste it here.</li>
+    </ol>
+    <label class="field"><span>Google OAuth Client ID</span><input id="gdClient" placeholder="123456789-abc.apps.googleusercontent.com" autocomplete="off"></label>
+    <div class="row"><button id="gdSaveId" class="primary" type="button">Save &amp; connect</button><button id="gdCancel" type="button" class="ghost">Cancel</button></div>
+  </section>
   <main id="main"></main>
 </div>
 
@@ -261,7 +276,7 @@ dl .total{border-top:1px solid var(--line);padding-top:6px}
   function loadLocal(){try{const d=JSON.parse(localStorage.getItem(LKEY));if(d&&d.data){const m=migrate(d.data);if(m)return {data:m,dirty:!!d.dirty};}}catch(e){}return null;}
   function setStatus(kind,text){const s=$('status');s.className='status '+kind;s.textContent=text;}
   function banner(msg,isErr){const b=$('banner');if(!msg){b.hidden=true;return;}b.hidden=false;b.className='banner'+(isErr?' err':'');b.textContent=msg;}
-  function changed(){dirty=true;saveLocal();if(!busy){if(mcp)setStatus('dirty','Unsaved changes');else setStatus('ok','Saved automatically on this device');}updateCounts();}
+  function changed(){dirty=true;saveLocal();if(!busy){if(mcp)setStatus('dirty','Unsaved changes');else if(gd.on){setStatus('dirty','Saving soon\u2026');gdSchedule();}else setStatus('ok','Saved on this device');}updateCounts();}
   function setBusy(b){busy=b;$('saveBtn').disabled=b||!mcp;}
   function explain(err){
     switch(err&&err.code){
@@ -589,6 +604,118 @@ dl .total{border-top:1px solid var(--line);padding-top:6px}
     p.querySelector('#addE').addEventListener('click',()=>{const f=p.querySelector('#ne-n');f.scrollIntoView({behavior:'smooth',block:'center'});f.focus();});
   }
 
+  // ---------- Google Drive on the GitHub site (Google sign-in; Claude's Drive link only works inside Claude) ----------
+  const GD_DEFAULT_CLIENT_ID='564314810510-n1m1kkt0k14kr78cnube8io34j3vu6h7.apps.googleusercontent.com'; // optional: paste your Google OAuth Client ID here so nobody has to enter it
+  const GD_SCOPE='https://www.googleapis.com/auth/drive.file';
+  const GD_FOLDER='Bakery App', GD_FILE='bakery-setup.json', GD_K='bakeryApp.gd.';
+  const gd={on:false,tok:null,exp:0,client:null,folderId:null,fileId:null,timer:null,saving:false,again:false,pending:null};
+  const gGet=k=>{try{return localStorage.getItem(GD_K+k);}catch(e){return null;}};
+  const gSet=(k,v)=>{try{v==null?localStorage.removeItem(GD_K+k):localStorage.setItem(GD_K+k,v);}catch(e){}};
+  const gdClientId=()=>(gGet('clientId')||GD_DEFAULT_CLIENT_ID||'').trim();
+  function gisReady(){return new Promise((res,rej)=>{
+    if(window.google&&google.accounts&&google.accounts.oauth2)return res();
+    let s=document.getElementById('gis');
+    if(!s){s=document.createElement('script');s.id='gis';s.src='https://accounts.google.com/gsi/client';s.async=true;document.head.appendChild(s);}
+    s.addEventListener('load',()=>res());s.addEventListener('error',()=>rej({message:'Google sign-in couldn’t load. Check your internet connection.'}));
+  });}
+  async function gdSignIn(quiet){ // must run from a tap the first time (opens Google's pop-up)
+    await gisReady();
+    return new Promise((res,rej)=>{
+      gd.client=google.accounts.oauth2.initTokenClient({client_id:gdClientId(),scope:GD_SCOPE,
+        callback:r=>{if(r.error)return rej({message:r.error_description||r.error});gd.tok=r.access_token;gd.exp=Date.now()+(r.expires_in||3600)*1000;
+          try{sessionStorage.setItem(GD_K+'tok',JSON.stringify({t:gd.tok,e:gd.exp}));}catch(e){}res();},
+        error_callback:e=>rej({message:e&&e.type==='popup_closed'?'The Google sign-in window was closed.':e&&e.type==='popup_failed_to_open'?'Your browser blocked the Google sign-in pop-up. Allow pop-ups for this site and try again.':'Google sign-in failed.'})});
+      gd.client.requestAccessToken({prompt:quiet?'':'consent',hint:gGet('email')||undefined});
+    });
+  }
+  async function api(url,opts={}){
+    if(!gd.tok||gd.exp<Date.now()+30000)throw {status:401,message:'signed out'};
+    const r=await fetch(url,Object.assign({},opts,{headers:Object.assign({Authorization:'Bearer '+gd.tok},opts.headers||{})}));
+    if(r.status===401){gd.tok=null;throw {status:401,message:'signed out'};}
+    if(!r.ok){let m='HTTP '+r.status;try{const j=await r.json();m=(j.error&&j.error.message)||m;}catch(e){}throw {status:r.status,message:m};}
+    return r;
+  }
+  function gdExplain(e){
+    if(e&&e.status===401)return 'Your Google sign-in has expired. Tap “Connect Google Drive” to carry on saving.';
+    if(e&&e.status===403)return 'Google Drive refused access: '+e.message+' Check the Drive API is enabled in your Google Cloud project.';
+    if(e&&/idpiframe|origin|redirect_uri|invalid_client/i.test(e.message||''))return 'Google didn’t accept the app settings: '+e.message+' Check the Client ID and that '+location.origin+' is an Authorised JavaScript origin.';
+    if(e instanceof TypeError)return 'Couldn’t reach Google Drive. Check your internet connection.';
+    return 'Google Drive problem: '+((e&&e.message)||'unknown error');
+  }
+  const Q=s=>encodeURIComponent(s);
+  async function gdFind(){
+    if(!gd.folderId){
+      const r=await (await api('https://www.googleapis.com/drive/v3/files?q='+Q(`name='${GD_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)+'&fields=files(id)&spaces=drive')).json();
+      if(r.files&&r.files.length)gd.folderId=r.files[0].id;
+      else{const c=await (await api('https://www.googleapis.com/drive/v3/files?fields=id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:GD_FOLDER,mimeType:'application/vnd.google-apps.folder'})})).json();gd.folderId=c.id;}
+    }
+    const f=await (await api('https://www.googleapis.com/drive/v3/files?q='+Q(`name='${GD_FILE}' and '${gd.folderId}' in parents and trashed=false`)+'&orderBy=modifiedTime desc&fields=files(id,modifiedTime)&spaces=drive')).json();
+    gd.fileId=f.files&&f.files.length?f.files[0].id:null;
+  }
+  async function gdLoad(){
+    setStatus('busy','Loading from Google Drive…');
+    await gdFind();if(!gd.fileId)return null;
+    const r=await api('https://www.googleapis.com/drive/v3/files/'+gd.fileId+'?alt=media');
+    return migrate(JSON.parse(await r.text()));
+  }
+  async function gdSave(){
+    if(gd.saving){gd.again=true;return;}
+    gd.saving=true;setStatus('busy','Saving to Google Drive…');
+    try{
+      if(!gd.folderId)await gdFind();
+      const body=JSON.stringify(data);
+      const url=gd.fileId?'https://www.googleapis.com/upload/drive/v3/files/'+gd.fileId+'?uploadType=resumable':'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id';
+      const meta=gd.fileId?{}:{name:GD_FILE,parents:[gd.folderId],mimeType:'application/json'};
+      const s=await api(url,{method:gd.fileId?'PATCH':'POST',headers:{'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':'application/json'},body:JSON.stringify(meta)});
+      const loc=s.headers.get('Location');if(!loc)throw {message:'Google Drive didn’t start the upload.'};
+      const up=await fetch(loc,{method:'PUT',headers:{'Content-Type':'application/json'},body});
+      if(!up.ok)throw {status:up.status,message:'upload failed (HTTP '+up.status+')'};
+      if(!gd.fileId){try{gd.fileId=(await up.json()).id;}catch(e){}}
+      dirty=false;saveLocal();
+      setStatus('ok','Saved to Google Drive · '+new Date().toLocaleTimeString('en-ZA',{hour:'2-digit',minute:'2-digit'}));
+    }catch(e){
+      if(e&&e.status===401){setGdConnected(false);setStatus('dirty','Not saved · tap Connect Google Drive');}
+      else{setStatus('err','Not saved to Drive');banner(gdExplain(e)+' Your changes are safe on this device.',true);}
+    }finally{gd.saving=false;if(gd.again){gd.again=false;gdSave();}}
+  }
+  function gdSchedule(){if(!gd.on)return;clearTimeout(gd.timer);gd.timer=setTimeout(gdSave,2500);}
+  function setGdConnected(on){
+    gd.on=on;$('gdBtn').hidden=on;$('gdMenu').hidden=!on;
+    const f=$('gdFolder');if(on&&gd.folderId){f.href='https://drive.google.com/drive/folders/'+gd.folderId;f.hidden=false;}else f.hidden=true;
+  }
+  function drawGdPanel(show){const p=$('gdPanel');p.hidden=!show;if(show){$('gdClient').value=gdClientId();$('gdOrigin').textContent=location.origin;}}
+  async function gdConnect(){
+    if(!gdClientId()){drawGdPanel(true);return;}
+    const first=!gGet('ok');
+    try{await gdSignIn(!first);gSet('ok','1');}catch(e){banner(gdExplain(e),true);return;}
+    try{
+      const remote=await gdLoad();setGdConnected(true);
+      if(!remote){await gdSave();banner('Connected. Your work now saves automatically to the “Bakery App” folder in your Google Drive.');return;}
+      if(dirty&&first){
+        const b=$('banner');b.hidden=false;b.className='banner';
+        b.innerHTML='Your Google Drive already has a saved copy. Which version do you want to keep? <span class="row" style="margin-top:8px"><button type="button" class="primary" id="gdKeepLocal">Keep this device’s version</button><button type="button" id="gdUseRemote">Use the Google Drive version</button></span>';
+        $('gdKeepLocal').onclick=()=>{banner('');gdSave();};
+        $('gdUseRemote').onclick=()=>{data=remote;dirty=false;saveLocal();banner('');render();setStatus('ok','Loaded from Google Drive');};
+        setStatus('dirty','Choose a version');return;
+      }
+      if(dirty){banner('');gdSave();return;} // reconnecting after a sign-in lapse: push this device's newer changes
+      data=remote;dirty=false;saveLocal();render();banner('');setStatus('ok','Synced with Google Drive');
+    }catch(e){setStatus('err','Drive not connected');banner(gdExplain(e),true);}
+  }
+  async function initGoogleDrive(){
+    $('gdBtn').hidden=false;
+    $('gdBtn').onclick=gdConnect;
+    $('gdSaveId').onclick=()=>{const v=$('gdClient').value.trim();if(!/\.apps\.googleusercontent\.com$/.test(v)){banner('That doesn’t look like a Google Client ID. It ends in .apps.googleusercontent.com',true);return;}gSet('clientId',v);gSet('ok',null);drawGdPanel(false);banner('');gdConnect();};
+    $('gdCancel').onclick=()=>drawGdPanel(false);
+    $('gdSettings').onclick=()=>drawGdPanel(true);
+    $('gdSync').onclick=()=>gdSave();
+    $('gdOut').onclick=()=>{if(gd.tok&&window.google){try{google.accounts.oauth2.revoke(gd.tok,()=>{});}catch(e){}}gd.tok=null;gSet('ok',null);try{sessionStorage.removeItem(GD_K+'tok');}catch(e){}setGdConnected(false);setStatus('ok','Saved on this device');};
+    try{const t=JSON.parse(sessionStorage.getItem(GD_K+'tok')||'null');if(t&&t.e>Date.now()+60000){gd.tok=t.t;gd.exp=t.e;}}catch(e){}
+    if(gdClientId())gisReady().catch(()=>{});
+    if(gd.tok){try{const remote=await gdLoad();setGdConnected(true);if(remote&&!dirty){data=remote;saveLocal();render();}setStatus(dirty?'dirty':'ok',dirty?'Unsaved changes':'Synced with Google Drive');if(dirty)gdSchedule();return;}catch(e){}}
+    if(gGet('ok'))setStatus(dirty?'dirty':'ok',dirty?'Tap Connect Google Drive to save':'Tap Connect Google Drive to sync');
+  }
+
   // ---------- boot ----------
   $('saveBtn').addEventListener('click',saveToDrive);
   $('dlBtn').addEventListener('click',()=>{
@@ -614,8 +741,9 @@ dl .total{border-top:1px solid var(--line);padding-top:6px}
     setBusy(false);
     if(!mcp){
       $('saveBtn').hidden=true;$('dlBtn').hidden=false;$('ulBtn').hidden=false;
-      setStatus('ok','Saved automatically on this device');
-      try{if(!localStorage.getItem(LKEY+'.hint')){banner('Your work saves automatically in this browser. Press \u201cDownload backup\u201d now and then and keep the file somewhere safe, like your Google Drive. \u201cOpen backup\u201d loads it on another device.');localStorage.setItem(LKEY+'.hint','1');}}catch(e){}
+      setStatus('ok','Saved on this device');
+      if(!window.claude){initGoogleDrive();}
+      else banner('Google Drive isn\u2019t available in this view, so your work is kept in this browser.');
       return;}
     if(dirty){setStatus('dirty','Unsaved changes');return;}
     loadFromDrive();
